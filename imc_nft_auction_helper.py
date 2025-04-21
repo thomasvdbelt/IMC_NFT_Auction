@@ -1,6 +1,11 @@
 # imc_nft_auction_helper.py
-"""Streamlit dashboard to assist with IMC NFT Auction Game.
-Tracks auction state, player holdings, and computes strategic fair value and nomination edges.
+"""Streamlit dashboard – IMC NFT Auction Game (v3)
+Now with:
+• Separate Nomination tab
+• Scarcity‑aware fair values
+• Edge‑ranking nomination list
+• Top‑rarity tracker with colour‑coded availability
+• Matrix‑style player overview
 """
 
 import streamlit as st
@@ -10,11 +15,11 @@ import numpy as np
 # ---- CONFIG -------------------------------------------------------------
 STARTING_BUDGET = 50
 BACKGROUND_COLORS = ["Blue", "Aquamarine", "Yellow"]
-GOLD_FUR_VALUE_BOOST = 1.5  # base boost when player lacks gold
+GOLD_FUR_VALUE_BOOST = 1.5
 MISSING_BACKGROUND_BOOST = 0.8
 UPGRADE_BACKGROUND_BOOST = 0.3
-SCARCITY_SCALE = 1.2        # scales demand‑vs‑supply weight
-UNIQUENESS_SCALE = 0.4      # how much uniqueness among top scores matters
+SCARCITY_SCALE = 1.2
+UNIQUENESS_SCALE = 0.4
 SAFETY_CASH_BUFFER = 2
 # ------------------------------------------------------------------------
 
@@ -38,167 +43,152 @@ if 'num_players' not in s:
 if 'auctioned_ids' not in s:
     s.auctioned_ids = set()
 
-# ---- HELPER UTILS -------------------------------------------------------
+# ---- UTILS --------------------------------------------------------------
 
 def remaining_df():
     return df[~df['id'].isin(s.auctioned_ids)]
 
-def tokens_of(player):
-    return df[df['id'].isin(s.players[player]['tokens'])]
+def tokens_of(p):
+    return df[df['id'].isin(s.players[p]['tokens'])]
 
-def has_gold(player):
-    return not tokens_of(player)[tokens_of(player)['Fur'] == 'Solid Gold'].empty
+def has_gold(p):
+    return not tokens_of(p)[tokens_of(p)['Fur'] == 'Solid Gold'].empty
 
-def missing_backgrounds(player):
-    owned_bg = set(tokens_of(player)['Background'])
-    return [c for c in BACKGROUND_COLORS if c not in owned_bg]
+def missing_bg(p):
+    return [c for c in BACKGROUND_COLORS if c not in set(tokens_of(p)['Background'])]
 
-# ---- STRATEGIC FAIR VALUE ----------------------------------------------
+# Fair value helpers ------------------------------------------------------
 
-def scarcity_multiplier(token_row):
-    """Demand / supply factor (>=1)."""
+def scarcity_mult(row):
     rem = remaining_df()
-    demand = 0
-    supply = 0
-    # Gold scarcity
-    if token_row['Fur'] == 'Solid Gold':
+    if row['Fur'] == 'Solid Gold':
         demand = sum(1 for p in s.players if not has_gold(p))
-        supply = len(rem[rem['Fur'] == 'Solid Gold'])
+        supply = len(rem[rem['Fur'] == 'Solid Gold']) or 1
     else:
-        color = token_row['Background']
-        demand = sum(1 for p in s.players if color in missing_backgrounds(p))
-        supply = len(rem[rem['Background'] == color])
-    supply = max(supply, 1)  # avoid div/0
+        col = row['Background']
+        demand = sum(1 for p in s.players if col in missing_bg(p))
+        supply = len(rem[rem['Background'] == col]) or 1
     return 1 + SCARCITY_SCALE * (demand / supply)
 
-
-def uniqueness_bonus(token_row):
-    """Boost if this token is far better than the second‑best remaining in same bg."""
-    same_bg = remaining_df()[remaining_df()['Background'] == token_row['Background']]
+def uniqueness_bonus(row):
+    same_bg = remaining_df()[remaining_df()['Background'] == row['Background']]
     if same_bg.empty:
-        return 0
-    top_scores = same_bg['Total Score'].nlargest(2).tolist()
-    if len(top_scores) < 2:
-        return UNIQUENESS_SCALE  # only one left
-    gap = top_scores[0] - top_scores[1]
-    norm_gap = gap / (top_scores[0] + 1e-6)
-    return UNIQUENESS_SCALE * norm_gap
+        return UNIQUENESS_SCALE
+    top = same_bg['Total Score'].nlargest(2).tolist()
+    if len(top) < 2:
+        return UNIQUENESS_SCALE
+    gap = (top[0]-top[1])/(top[0]+1e-6)
+    return UNIQUENESS_SCALE * gap
 
+def upgrade_gain(row):
+    cur = tokens_of('Player 1')
+    cur_best = cur[cur['Background']==row['Background']]['Total Score'].max() if not cur.empty else 0
+    return max(row['Total Score']-cur_best,0)
 
-def marginal_upgrade(token_row):
-    """Score gain this token delivers over current best in its background."""
-    current_best = tokens_of('Player 1')
-    current_best = current_best[current_best['Background'] == token_row['Background']]['Total Score'].max() if not current_best.empty else 0
-    return max(token_row['Total Score'] - current_best, 0)
-
-
-def value_token(token_row):
-    base = token_row['Total Score']
-    bg_missing = token_row['Background'] in missing_backgrounds('Player 1')
-    gold_missing = not has_gold('Player 1')
-    v = 0
-    if token_row['Fur'] == 'Solid Gold':
-        # Completion value dominates
-        v = base * GOLD_FUR_VALUE_BOOST if gold_missing else marginal_upgrade(token_row)
-    elif bg_missing:
-        v = base * (1 + MISSING_BACKGROUND_BOOST)
+def value_token(row):
+    bg_need = row['Background'] in missing_bg('Player 1')
+    gold_need = not has_gold('Player 1')
+    if row['Fur']=='Solid Gold':
+        base = row['Total Score'] * (GOLD_FUR_VALUE_BOOST if gold_need else 1)
+    elif bg_need:
+        base = row['Total Score'] * (1+MISSING_BACKGROUND_BOOST)
     else:
-        v = marginal_upgrade(token_row)
-    # Scarcity & uniqueness
-    v *= scarcity_multiplier(token_row)
-    v += uniqueness_bonus(token_row) * base
-    return round(v, 1)
+        base = upgrade_gain(row)
+    v = base * scarcity_mult(row) + uniqueness_bonus(row) * row['Total Score']
+    return round(v,1)
 
-# ---- BID CEILING --------------------------------------------------------
+def bid_ceiling(row):
+    return min(value_token(row), s.players['Player 1']['budget']-SAFETY_CASH_BUFFER)
 
-def suggested_bid(token_row):
-    my_val = value_token(token_row)
-    max_afford = s.players['Player 1']['budget'] - SAFETY_CASH_BUFFER
-    return min(my_val, max_afford)
+# Nomination edge ---------------------------------------------------------
 
-# ---- NOMINATION EDGE ----------------------------------------------------
+def rival_val(row,r):
+    if row['Fur']=='Solid Gold':
+        return row['Total Score']*GOLD_FUR_VALUE_BOOST if not has_gold(r) else 0
+    if row['Background'] in missing_bg(r):
+        return row['Total Score']*(1+MISSING_BACKGROUND_BOOST)
+    return 0
 
-def rival_value(token_row, rival):
-    """Crude rival valuation: treat them like us but w.r.t their needs only."""
-    bg_missing = token_row['Background'] in missing_backgrounds(rival)
-    rival_gold_missing = not has_gold(rival)
-    if token_row['Fur'] == 'Solid Gold':
-        if rival_gold_missing:
-            return token_row['Total Score'] * GOLD_FUR_VALUE_BOOST
-        return 0
-    if bg_missing:
-        return token_row['Total Score'] * (1 + MISSING_BACKGROUND_BOOST)
-    return 0  # assume rivals don't pay just for upgrades (simplification)
+def edge_score(row):
+    myv = value_token(row)
+    top_rival = max([rival_val(row,p) for p in s.players if p!='Player 1'] or [0])
+    richest = max([s.players[p]['budget'] for p in s.players if p!='Player 1'] or [0])
+    edge = myv - top_rival + 0.1*(s.players['Player 1']['budget']-richest)
+    return edge,myv,top_rival
 
+# ---- SIDEBAR SETUP ------------------------------------------------------
+st.sidebar.header("🎯 Setup")
+num_in = st.sidebar.number_input("Players incl. you",2,20,max(s.num_players,2),1)
+s.num_players=int(num_in)
+for i in range(1,s.num_players+1):
+    k=f"Player {i}"
+    if k not in s.players:
+        s.players[k]={'budget':STARTING_BUDGET,'tokens':[]}
 
-def nomination_edge(token_row):
-    my_val = value_token(token_row)
-    rival_vals = [rival_value(token_row, p) for p in s.players if p != 'Player 1']
-    highest_rival = max(rival_vals) if rival_vals else 0
-    budget_block = max(0, s.players['Player 1']['budget'] - max((s.players[p]['budget'] for p in s.players if p != 'Player 1'), default=0))
-    edge_score = my_val - highest_rival + 0.1 * budget_block
-    return edge_score, my_val, highest_rival
+# ---- TABS ---------------------------------------------------------------
+main_tab, nom_tab = st.tabs(["Auction", "Nomination Helper"])
 
-# ---- SIDEBAR: GAME SETUP -----------------------------------------------
-st.sidebar.header("🎯 Game Setup")
-num_players_input = st.sidebar.number_input("Total players (incl. you)", 2, 20, max(s.num_players,2), 1)
-s.num_players = int(num_players_input)
-for i in range(1, s.num_players+1):
-    key = f"Player {i}"
-    if key not in s.players:
-        s.players[key] = {"budget": STARTING_BUDGET, "tokens": []}
-
-# ---- MAIN PAGE ---------------------------------------------------------
-st.title("💰 IMC NFT Auction Assistant – v2")
-
-col1, col2 = st.columns(2)
-with col1:
-    st.subheader("🧩 Current Auction")
-    current_id = st.text_input("Token id being auctioned", value="")
-    if current_id:
-        try:
-            cid = int(current_id)
-            token_row = df[df['id']==cid].iloc[0]
-            st.write(token_row[['Background','Fur','Total Score']])
-            st.markdown(f"**Fair value (you): ${value_token(token_row):.1f}**")
-            st.markdown(f"**Bid ceiling:** ${suggested_bid(token_row):.1f}")
-        except Exception:
-            st.error("Invalid id")
-with col2:
-    st.subheader("📦 Log a Sale")
-    with st.form("sale"):
-        sold_id = st.text_input("Sold token id")
-        buyer = st.selectbox("Buyer", list(s.players.keys()))
-        price = st.number_input("Price",1, STARTING_BUDGET,1)
-        if st.form_submit_button("Log"):
+# ============  AUCTION TAB  ============
+with main_tab:
+    st.title("💰 Live Auction")
+    colA,colB = st.columns(2)
+    with colA:
+        st.subheader("Current Token")
+        tid = st.text_input("ID on the block")
+        if tid:
             try:
-                sid = int(sold_id)
-                if sid in s.auctioned_ids:
-                    st.warning("Already logged")
-                else:
-                    s.auctioned_ids.add(sid)
-                    s.players[buyer]['tokens'].append(sid)
-                    s.players[buyer]['budget'] -= price
-                    st.success("Logged!")
-            except:
-                st.error("Bad id")
+                tid=int(tid)
+                tok=df[df['id']==tid].iloc[0]
+                st.json(tok[['Background','Fur','Total Score']].to_dict())
+                st.metric("Fair value",f"${value_token(tok):.1f}")
+                st.metric("Bid ceiling",f"${bid_ceiling(tok):.1f}")
+            except Exception:
+                st.error("Bad ID")
+    with colB:
+        st.subheader("Log sale")
+        with st.form("sale"):
+            sold = st.text_input("Sold token id")
+            buyer = st.selectbox("Buyer",list(s.players.keys()))
+            price = st.number_input("Price",1,STARTING_BUDGET,1)
+            if st.form_submit_button("Add"):
+                try:
+                    sid=int(sold)
+                    if sid in s.auctioned_ids:
+                        st.warning("Already logged")
+                    else:
+                        s.auctioned_ids.add(sid)
+                        s.players[buyer]['tokens'].append(sid)
+                        s.players[buyer]['budget']-=price
+                        st.success("Recorded")
+                except:
+                    st.error("Bad id")
+    st.divider()
+    st.subheader("Player Matrix")
+    matrix=pd.DataFrame([{**{"Player":p,"Budget":d['budget']},
+                          **{bg:("✅" if bg not in missing_bg(p) else "❌") for bg in BACKGROUND_COLORS},
+                          **{"Gold":"✅" if has_gold(p) else "❌"}}
+                         for p,d in s.players.items()])
+    st.dataframe(matrix.set_index('Player'))
 
-st.divider()
+# ============  NOMINATION TAB  ============
+with nom_tab:
+    st.title("🎯 Nomination Helper")
+    rem=remaining_df().copy()
+    rem[['Edge','MyVal','TopRival']]=rem.apply(edge_score,axis=1,result_type='expand')
+    st.subheader("Smart nominations (Edge ranking)")
+    st.dataframe(rem.sort_values('Edge',ascending=False).head(20)[['id','Background','Fur','Total Score','Edge','MyVal','TopRival']])
 
-# ---- NOMINATION RECOMMENDER TAB ---------------------------------------
-with st.expander("💡 Smart Nomination Suggestions", expanded=False):
-    rem = remaining_df().copy()
-    edges = rem.apply(nomination_edge, axis=1, result_type='expand')
-    rem[['Edge','MyVal','TopRival']] = edges
-    top_nom = rem.sort_values('Edge', ascending=False).head(20)[['id','Background','Fur','Total Score','Edge','MyVal','TopRival']]
-    st.dataframe(top_nom)
-
-st.divider()
-st.subheader("📊 Player Overview")
-for player, data in s.players.items():
-    st.markdown(f"### {player} — 💵 ${data['budget']}")
-    st.markdown(f"Needs: {', '.join(missing_backgrounds(player)) or 'None'} | Gold: {'✅' if has_gold(player) else '❌'}")
-    if data['tokens']:
-        st.dataframe(df[df['id'].isin(data['tokens'])][['id','Background','Fur','Total Score']])
-    else:
-        st.markdown("_No tokens yet_")
+    st.subheader("Top rarity tokens by category")
+    # Build table of top 15 for each bg + gold
+    pieces=[]
+    for bg in BACKGROUND_COLORS:
+        top=df[df['Background']==bg].nlargest(15,'Total Score')[[
+            'id','Total Score']].copy()
+        top['Category']=bg
+        pieces.append(top)
+    gold_top=df[df['Fur']=='Solid Gold'].nlargest(15,'Total Score')[['id','Total Score']]
+    gold_top['Category']='Gold'
+    pieces.append(gold_top)
+    catdf=pd.concat(pieces)
+    catdf['Status']=catdf['id'].apply(lambda x:'🟥 Gone' if x in s.auctioned_ids else '🟩 Left')
+    st.dataframe(catdf[['Category','id','Total Score','Status']])
