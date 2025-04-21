@@ -78,13 +78,17 @@ def value_token(token_row):
 
 # ---- SIDEBAR: GAME SETUP & TRACKING -------------------------------------
 st.sidebar.header("🎯 Game Setup")
-st.session_state.num_players = st.sidebar.number_input(
+
+# Get number of players safely without crashing
+num_players_input = st.sidebar.number_input(
     "Total players (incl. you)",
     min_value=2,
     max_value=20,
-    value=2,  # FIXED!
+    value=max(st.session_state.get("num_players", 2), 2),  # always at least 2
     step=1
 )
+st.session_state.num_players = num_players_input
+
 
 # Initialize missing players
 for i in range(1, st.session_state.num_players + 1):
