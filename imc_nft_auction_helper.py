@@ -1,6 +1,6 @@
 # imc_nft_auction_helper.py
 """Streamlit dashboard to assist with IMC NFT Auction Game.
-Track current auction state, player holdings, and compute fair value of tokens.
+Tracks current auction state, player holdings, and computes fair value of tokens.
 
 Author: ChatGPT (improved iteratively with Thomas)
 """
@@ -41,7 +41,7 @@ if 'auctioned_ids' not in st.session_state:
 if 'players' not in st.session_state:
     st.session_state.players = {"Player 1": {"budget": STARTING_BUDGET, "tokens": []}}
 if 'num_players' not in st.session_state:
-    st.session_state.num_players = 1
+    st.session_state.num_players = 2  # FIXED: now matches min_value
 
 # ---- HELPER FUNCTIONS ---------------------------------------------------
 def remaining_df():
@@ -54,7 +54,7 @@ def collection_df(player):
 def collection_status(player):
     owned = collection_df(player)
     backgrounds_owned = set(owned['Background'])
-    has_gold = not owned[owned['Fur']=='Solid Gold'].empty
+    has_gold = not owned[owned['Fur'] == 'Solid Gold'].empty
     missing_bg = [c for c in BACKGROUND_COLORS if c not in backgrounds_owned]
     return backgrounds_owned, missing_bg, has_gold
 
@@ -67,7 +67,8 @@ def value_token(token_row):
     if token_row['Background'] in missing_bg:
         multiplier += MISSING_BACKGROUND_BOOST
     else:
-        current_best = collection_df("Player 1")[collection_df("Player 1")['Background']==token_row['Background']]['Total Score'].max() if not collection_df("Player 1")[collection_df("Player 1")['Background']==token_row['Background']].empty else 0
+        current_best = collection_df("Player 1")
+        current_best = current_best[current_best['Background'] == token_row['Background']]['Total Score'].max() if not current_best.empty else 0
         if token_row['Total Score'] > current_best:
             multiplier += UPGRADE_BACKGROUND_BOOST
     remaining_bg_count = remaining_df()['Background'].value_counts().to_dict().get(token_row['Background'], 0)
@@ -77,10 +78,16 @@ def value_token(token_row):
 
 # ---- SIDEBAR: GAME SETUP & TRACKING -------------------------------------
 st.sidebar.header("🎯 Game Setup")
-st.session_state.num_players = st.sidebar.number_input("Total players (incl. you)", min_value=2, max_value=20, value=st.session_state.num_players, step=1)
+st.session_state.num_players = st.sidebar.number_input(
+    "Total players (incl. you)",
+    min_value=2,
+    max_value=20,
+    value=2,  # FIXED!
+    step=1
+)
 
-# Initialize players if needed
-for i in range(1, st.session_state.num_players+1):
+# Initialize missing players
+for i in range(1, st.session_state.num_players + 1):
     player_key = f"Player {i}"
     if player_key not in st.session_state.players:
         st.session_state.players[player_key] = {"budget": STARTING_BUDGET, "tokens": []}
@@ -93,10 +100,10 @@ current_id = st.text_input("Current token id being auctioned", value="")
 if current_id:
     try:
         cid = int(current_id)
-        token_row = df[df['id']==cid].iloc[0]
+        token_row = df[df['id'] == cid].iloc[0]
         val = value_token(token_row)
         st.success(f"🎯 Fair value estimate (you): ${val:.1f}")
-        st.json(token_row[['Background','Fur','Total Score']].to_dict())
+        st.json(token_row[['Background', 'Fur', 'Total Score']].to_dict())
     except:
         st.error("Invalid token id.")
 
@@ -125,7 +132,7 @@ st.subheader("📊 Player Overview")
 for player, data in st.session_state.players.items():
     st.markdown(f"**{player}** — Budget: ${data['budget']}")
     if data['tokens']:
-        tokens_df = df[df['id'].isin(data['tokens'])][['id','Background','Fur','Total Score']]
+        tokens_df = df[df['id'].isin(data['tokens'])][['id', 'Background', 'Fur', 'Total Score']]
         st.dataframe(tokens_df)
     else:
         st.markdown("_No tokens yet._")
