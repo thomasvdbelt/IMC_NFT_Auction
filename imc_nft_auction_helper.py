@@ -1,9 +1,5 @@
 # imc_nft_auction_helper.py
-"""
-Streamlit dashboard for IMC NFT Auction Game (Simplified Bidding Logic)
-Focus: Budget-aware scarcity-driven utility scoring without sabotage logic
-Author: ChatGPT (Aaron Edition)
-"""
+
 
 import streamlit as st
 import pandas as pd
@@ -60,10 +56,12 @@ def total_score(player):
 # =============== SCARCITY TRACKING ===============
 def category_scarcity():
     rem = remaining_df()
-    bg_demand = {bg: 0 for bg in MANDATORY_BACKGROUNDS}
+    bg_demand = {bg: 0 for bg in MANDATORY_BACKGROUNDS + ["Gold"]}
     for p in S.players:
         for bg in missing_bgs(p):
             bg_demand[bg] += 1
+        if not has_gold(p):
+            bg_demand["Gold"] += 1
     return bg_demand
 
 # =============== BID LOGIC ===============
@@ -80,32 +78,28 @@ def calculate_bid(token, player):
     if slots_left == 0:
         return 0.0
 
-    # Track background scarcity
-    scarcity = category_scarcity()
+    # Determine whether this token helps
     bg = token['Background']
     fur = token['Fur']
     rarity = token['Total Score']
 
-    # If we don't need this background or gold, skip
-    if bg not in missing and (fur != 'Solid Gold' or not needs_gold):
+    contributes_bg = bg in missing
+    contributes_gold = fur == 'Solid Gold' and needs_gold
+
+    if not contributes_bg and not contributes_gold:
         return 0.0
 
-    # Determine token category
-    category = "Gold" if fur == "Solid Gold" and needs_gold else bg
-    demand = scarcity.get(category, 0)
+    # Category scarcity tracking
+    scarcity = category_scarcity()
 
-    if demand == 0:
-        return 0.0
-
-    top_in_category = rem[rem['Background'] == category] if category != 'Gold' else rem[rem['Fur'] == 'Solid Gold']
-    top_rarities = top_in_category.sort_values('Total Score', ascending=False).head(demand)['Total Score'].tolist()
-    if len(top_rarities) <= 1:
-        scarcity_factor = 1.5  # very scarce
-    else:
-        scarcity_factor = 1 + (top_rarities[0] - top_rarities[-1]) / (top_rarities[0] + 1e-6)
-
-    # Rarity share across needed categories
+    categories_needed = []
     total_needed_rarity = 0
+
+    if contributes_bg:
+        categories_needed.append(bg)
+    if contributes_gold:
+        categories_needed.append("Gold")
+
     for need in missing:
         top_bg = rem[rem['Background'] == need]
         top_score = top_bg['Total Score'].max() if not top_bg.empty else 0.01
@@ -115,14 +109,28 @@ def calculate_bid(token, player):
         gold_score = golds['Total Score'].max() if not golds.empty else 0.01
         total_needed_rarity += gold_score
 
-    rarity_fraction = rarity / total_needed_rarity if total_needed_rarity > 0 else 0.3
+    # Calculate scarcity factor
+    all_factors = []
+    for cat in categories_needed:
+        if cat == "Gold":
+            cat_tokens = rem[rem['Fur'] == 'Solid Gold']
+        else:
+            cat_tokens = rem[rem['Background'] == cat]
+        demand = scarcity.get(cat, 1)
+        top_rarities = cat_tokens.sort_values('Total Score', ascending=False).head(demand)['Total Score'].tolist()
+        if len(top_rarities) <= 1:
+            scarcity_factor = 1.5
+        else:
+            scarcity_factor = 1 + (top_rarities[0] - top_rarities[-1]) / (top_rarities[0] + 1e-6)
+        all_factors.append((scarcity_factor, cat_tokens['Total Score'].max() if not cat_tokens.empty else 0.01))
 
-    # If this is the last slot, spend all budget
+    combined_score = sum(rarity if cat == bg or (cat == "Gold" and fur == "Solid Gold") else 0 for _, cat_score in all_factors)
+    budget_fraction = combined_score / total_needed_rarity if total_needed_rarity > 0 else 0.3
+
     if slots_left == 1:
         return round(budget, 1)
 
-    bid_fraction = rarity_fraction * scarcity_factor
-    bid = min(budget, budget * bid_fraction)
+    bid = min(budget, budget * budget_fraction)
     return round(bid, 1)
 
 # =============== SIDEBAR CONFIG ===============
