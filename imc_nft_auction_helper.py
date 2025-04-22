@@ -12,7 +12,7 @@ import numpy as np
 # =============== CONFIGURATION ===============
 STARTING_BUDGET = 50
 MANDATORY_BACKGROUNDS = ["Blue", "Aquamarine", "Yellow"]
-GOLD_BONUS_MULTIPLIER = 1.2  # <= Added parameter for user control over Gold weighting
+GOLD_BONUS_MULTIPLIER = 1.2  # <= Adjustable in sidebar
 
 # =============== LOAD DATA ===============
 @st.cache_data
@@ -51,12 +51,22 @@ def missing_bgs(player):
 
 def total_score(player):
     owned = tokens_of(player)
-    score = 0
+    best_scores = []
+    used_ids = set()
     for bg in MANDATORY_BACKGROUNDS:
-        score += owned[owned['Background'] == bg]['Total Score'].max() if not owned[owned['Background'] == bg].empty else 0
-    if has_gold(player):
-        score += owned[owned['Fur'] == 'Solid Gold']['Total Score'].max() if not owned[owned['Fur'] == 'Solid Gold'].empty else 0
-    return round(score, 2)
+        match = owned[(owned['Background'] == bg) & (~owned['id'].isin(used_ids))]
+        if not match.empty:
+            row = match.sort_values('Total Score', ascending=False).iloc[0]
+            best_scores.append(row['Total Score'])
+            used_ids.add(row['id'])
+
+    golds = owned[(owned['Fur'] == 'Solid Gold') & (~owned['id'].isin(used_ids))]
+    if not golds.empty:
+        gold_row = golds.sort_values('Total Score', ascending=False).iloc[0]
+        best_scores.append(gold_row['Total Score'])
+        used_ids.add(gold_row['id'])
+
+    return round(sum(best_scores), 2)
 
 # =============== SCARCITY TRACKING ===============
 def category_scarcity():
@@ -83,7 +93,6 @@ def calculate_bid(token, player):
     if slots_left == 0:
         return 0.0
 
-    # Determine whether this token helps
     bg = token['Background']
     fur = token['Fur']
     rarity = token['Total Score']
@@ -94,7 +103,6 @@ def calculate_bid(token, player):
     if not contributes_bg and not contributes_gold:
         return 0.0
 
-    # Category scarcity tracking
     scarcity = category_scarcity()
 
     categories_needed = []
@@ -114,7 +122,6 @@ def calculate_bid(token, player):
         gold_score = golds['Total Score'].max() if not golds.empty else 0.01
         total_needed_rarity += gold_score * GOLD_BONUS_MULTIPLIER
 
-    # Calculate scarcity factor and combined score
     all_factors = []
     for cat in categories_needed:
         if cat == "Gold":
@@ -149,6 +156,14 @@ for i in range(1, S.num_players + 1):
 
 # Allow adjustment of Gold bonus multiplier
 GOLD_BONUS_MULTIPLIER = st.sidebar.slider("Gold Bonus Multiplier", 1.0, 3.0, GOLD_BONUS_MULTIPLIER, 0.1)
+
+# Display value of Wildcard (Gold) token for Player 1
+tokens = tokens_of("Player 1")
+available_gold = tokens[tokens['Fur'] == 'Solid Gold']
+available_gold = available_gold[~available_gold['id'].isin(tokens[tokens['Background'].isin([bg for bg in MANDATORY_BACKGROUNDS])]['id'])]
+if not available_gold.empty:
+    wildcard_score = available_gold['Total Score'].max()
+    st.sidebar.metric("Wildcard (Gold) Value", f"{wildcard_score:.2f}")
 
 # =============== MAIN TABS ===============
 auction_tab, browse_tab = st.tabs(["🎯 Auction Mode", "📦 Token Overview"])
