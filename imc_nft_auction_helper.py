@@ -1,5 +1,9 @@
 # imc_nft_auction_helper.py
-
+"""
+Streamlit dashboard for IMC NFT Auction Game (Simplified Bidding Logic)
+Focus: Budget-aware scarcity-driven utility scoring without sabotage logic
+Author: ChatGPT (Aaron Edition)
+"""
 
 import streamlit as st
 import pandas as pd
@@ -8,6 +12,7 @@ import numpy as np
 # =============== CONFIGURATION ===============
 STARTING_BUDGET = 50
 MANDATORY_BACKGROUNDS = ["Blue", "Aquamarine", "Yellow"]
+GOLD_BONUS_MULTIPLIER = 1.2  # <= Added parameter for user control over Gold weighting
 
 # =============== LOAD DATA ===============
 @st.cache_data
@@ -107,9 +112,9 @@ def calculate_bid(token, player):
     if needs_gold:
         golds = rem[rem['Fur'] == 'Solid Gold']
         gold_score = golds['Total Score'].max() if not golds.empty else 0.01
-        total_needed_rarity += gold_score
+        total_needed_rarity += gold_score * GOLD_BONUS_MULTIPLIER
 
-    # Calculate scarcity factor
+    # Calculate scarcity factor and combined score
     all_factors = []
     for cat in categories_needed:
         if cat == "Gold":
@@ -122,9 +127,12 @@ def calculate_bid(token, player):
             scarcity_factor = 1.5
         else:
             scarcity_factor = 1 + (top_rarities[0] - top_rarities[-1]) / (top_rarities[0] + 1e-6)
-        all_factors.append((scarcity_factor, cat_tokens['Total Score'].max() if not cat_tokens.empty else 0.01))
+        top_score = cat_tokens['Total Score'].max() if not cat_tokens.empty else 0.01
+        if cat == "Gold":
+            top_score *= GOLD_BONUS_MULTIPLIER
+        all_factors.append((scarcity_factor, top_score))
 
-    combined_score = sum(rarity if cat == bg or (cat == "Gold" and fur == "Solid Gold") else 0 for _, cat_score in all_factors)
+    combined_score = rarity * (GOLD_BONUS_MULTIPLIER if contributes_gold else 1)
     budget_fraction = combined_score / total_needed_rarity if total_needed_rarity > 0 else 0.3
 
     if slots_left == 1:
@@ -138,6 +146,9 @@ st.sidebar.title("Game Setup")
 S.num_players = st.sidebar.number_input("Players incl. you", 2, 20, value=S.num_players)
 for i in range(1, S.num_players + 1):
     S.players.setdefault(f"Player {i}", {"budget": STARTING_BUDGET, "tokens": []})
+
+# Allow adjustment of Gold bonus multiplier
+GOLD_BONUS_MULTIPLIER = st.sidebar.slider("Gold Bonus Multiplier", 1.0, 3.0, GOLD_BONUS_MULTIPLIER, 0.1)
 
 # =============== MAIN TABS ===============
 auction_tab, browse_tab = st.tabs(["🎯 Auction Mode", "📦 Token Overview"])
