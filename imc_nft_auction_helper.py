@@ -1,178 +1,211 @@
 # imc_nft_auction_helper.py
 """
-IMC NFT Auction Assistant – v6
-Preference‑score allocation model
----------------------------------
-* Utility = ΔScore·Scarcity + NeedBonus + GoldBonus + BlockBonus
-* Cash slice = Utility / (Utility + best‑alternative utilities) × free budget
-* MaxBid never exceeds budget and always leaves $1 per still‑missing mandatory token
+Streamlit dashboard for IMC NFT Auction Game
+Focus: Clear bidding logic, token utility scoring, dynamic dashboard
+Author: ChatGPT (Aaron Edition)
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 
-# ---------- LOAD DATA ----------------------------------------------------
+# =============== CONFIGURATION ===============
+STARTING_BUDGET = 50
+MANDATORY_BACKGROUNDS = ["Blue", "Aquamarine", "Yellow"]
+
+# Utility weight defaults
+DEFAULT_NEED_BG = 10
+DEFAULT_NEED_GOLD = 15
+DEFAULT_BLOCK = 5
+DEFAULT_SCARCITY = 1.0
+UPGRADE_MULTIPLIER = 1.5
+
+# =============== LOAD DATA ===============
 @st.cache_data
-def load_tokens():
-    df = pd.read_excel('NFT_Auction_Data.xlsx')
-    if 'Total Score' not in df.columns:
-        cols=[c for c in df.columns if 'Rarity' in c and 'Total' not in c]
-        df['Total Score']=(1/df[cols]).sum(axis=1)
+def load_data():
+    df = pd.read_excel("NFT_Auction_Data.xlsx")
+    if "Total Score" not in df.columns:
+        cols = [c for c in df.columns if "Rarity" in c and "Total" not in c]
+        df["Total Score"] = (1 / df[cols]).sum(axis=1)
     return df
 
-df = load_tokens()
-ALL_GOLD=set(df[df['Fur']=='Solid Gold']['id'])
-Q90 = df['Total Score'].quantile(0.9)
-PTS_PER_DOLLAR = Q90/20   # heuristic anchor (90th‑pct token ≈ $20)
+df = load_data()
+ALL_GOLD = set(df[df['Fur'] == 'Solid Gold']['id'])
+REQUIRED = MANDATORY_BACKGROUNDS + ['Gold']
 
-MANDATORY_BGS=["Blue","Aquamarine","Yellow"]
+# =============== SESSION STATE ===============
+S = st.session_state
+if "players" not in S:
+    S.players = {"Player 1": {"budget": STARTING_BUDGET, "tokens": []}}
+if "num_players" not in S:
+    S.num_players = 13
+if "auctioned_ids" not in S:
+    S.auctioned_ids = set()
 
-# ---------- SESSION STATE -----------------------------------------------
-S=st.session_state
-if 'players' not in S: S.players={"Player 1":{"budget":50,"tokens":[]}}
-if 'num_players' not in S: S.num_players=2
-if 'sold' not in S: S.sold=set()
+# =============== UTILITY FUNCTIONS ===============
+def remaining_df():
+    return df[~df['id'].isin(S.auctioned_ids)]
 
-# ---------- HELPERS ------------------------------------------------------
+def tokens_of(player):
+    return df[df['id'].isin(S.players[player]['tokens'])]
 
-def rem_df():
-    return df[~df['id'].isin(S.sold)]
+def has_gold(player):
+    return any(t in ALL_GOLD for t in S.players[player]['tokens'])
 
-def tokens_of(p):
-    return df[df['id'].isin(S.players[p]['tokens'])]
+def missing_bgs(player):
+    owned = set(tokens_of(player)['Background'])
+    return [bg for bg in MANDATORY_BACKGROUNDS if bg not in owned]
 
-def has_gold(p):
-    return any(t in ALL_GOLD for t in S.players[p]['tokens'])
+def player_status(player):
+    return {
+        "Budget": S.players[player]['budget'],
+        "Gold": "✅" if has_gold(player) else "❌",
+        **{bg: "✅" if bg not in missing_bgs(player) else "❌" for bg in MANDATORY_BACKGROUNDS}
+    }
 
-def missing_bgs(p):
-    owned=set(tokens_of(p)['Background'])
-    return [bg for bg in MANDATORY_BGS if bg not in owned]
-
-# ---------- SIDEBAR CONFIG ----------------------------------------------
-with st.sidebar:
-    st.header("Game setup")
-    S.num_players=int(st.number_input("Players incl. you",2,20, S.num_players))
-    for i in range(1,S.num_players+1):
-        S.players.setdefault(f"Player {i}",{"budget":50,"tokens":[]})
-
-    st.header("Utility weights")
-    w_need_bg   = st.slider("Need bonus (background)",  0,500,200,50)
-    w_need_gold = st.slider("Need bonus (gold)",        0,600,250,50)
-    w_block     = st.slider("Block bonus (per rival)",  0,200, 50,10)
-    scar_scale  = st.slider("Scarcity scale",0.0,3.0,1.0,0.1)
-    up_mult     = st.slider("Upgrade multiplier",0.0,3.0,1.5,0.1)
-
-# ---------- SCARCITY PRECOMPUTE -----------------------------------------
-REM = rem_df()
-BG_SUPPLY=REM['Background'].value_counts().to_dict()
-GOLD_SUPPLY=len(REM[REM['Fur']=='Solid Gold']) or 1
-
-# ---------- UTILITY FUNCTION --------------------------------------------
-
-def scarcity(row):
-    if row['Fur']=='Solid Gold':
-        demand=sum(1 for p in S.players if not has_gold(p))
-        return 1+scar_scale*demand/GOLD_SUPPLY
-    col=row['Background']; demand=sum(1 for p in S.players if col in missing_bgs(p))
-    supply=BG_SUPPLY.get(col,1)
-    return 1+scar_scale*demand/supply
+# =============== PREFERENCE SCORING ===============
+def scarcity_factors():
+    rem = remaining_df()
+    bg_counts = rem['Background'].value_counts().to_dict()
+    gold_remain = len(rem[rem['Fur'] == 'Solid Gold']) or 1
+    return bg_counts, gold_remain
 
 
-def delta_score(row, player):
-    cur=tokens_of(player)
-    old=cur[cur['Background']==row['Background']]['Total Score'].max() if not cur.empty else 0
-    return max(row['Total Score']-old,0)
+def utility_score(row, player, w_bg, w_gold, w_block, w_scarcity):
+    cur_tokens = tokens_of(player)
+    owned_bgs = set(cur_tokens['Background'])
+    has_gold_fur = has_gold(player)
+    delta_score = 0
 
+    # Upgrade value
+    old = cur_tokens[cur_tokens['Background'] == row['Background']]['Total Score'].max() if not cur_tokens.empty else 0
+    delta_score = max(row['Total Score'] - old, 0)
 
-def preference(row, player):
-    util=delta_score(row,player)*scarcity(row)*up_mult
-    if row['Fur']=='Solid Gold' and not has_gold(player):
-        util+=w_need_gold
-    if row['Background'] in missing_bgs(player):
-        util+=w_need_bg
-    # block rivals
-    rivals_missing=sum(1 for r in S.players if r!=player and (
-        (row['Fur']=='Solid Gold' and not has_gold(r)) or
-        (row['Background'] in missing_bgs(r)) ))
-    util+=w_block*rivals_missing
+    # Need bonuses
+    util = delta_score * UPGRADE_MULTIPLIER
+    if row['Background'] in MANDATORY_BACKGROUNDS and row['Background'] not in owned_bgs:
+        util += w_bg
+    if row['Fur'] == 'Solid Gold' and not has_gold_fur:
+        util += w_gold
+
+    # Scarcity scaling
+    bg_counts, gold_remain = scarcity_factors()
+    demand = sum(1 for p in S.players if p != player and (
+        (row['Background'] in missing_bgs(p)) or
+        (row['Fur'] == 'Solid Gold' and not has_gold(p))
+    ))
+    supply = bg_counts.get(row['Background'], 1) if row['Fur'] != 'Solid Gold' else gold_remain
+    scarcity = 1 + w_scarcity * demand / supply
+    util *= scarcity
+
+    # Block bonus
+    util += w_block * demand
     return util
 
-# ---------- BID CALC -----------------------------------------------------
 
-def max_bid(row, player):
-    budget=S.players[player]['budget']
-    if budget<=0: return 0.0
+def calculate_bid(row, player, weights):
+    budget = S.players[player]['budget']
+    if budget <= 0:
+        return 0.0
+    u = utility_score(row, player, *weights)
 
-    util_this=preference(row,player)
-    # estimate best util per still-missing requirement (excluding this token)
-    missing=list(missing_bgs(player))
-    if row['Background'] in missing: missing.remove(row['Background'])
-    if row['Fur']=='Solid Gold' and not has_gold(player): need_gold=False
-    else: need_gold = not has_gold(player)
+    # Estimate total utility needed to finish set
+    missing = missing_bgs(player)
+    if row['Background'] in missing:
+        missing.remove(row['Background'])
+    if row['Fur'] == 'Solid Gold' and not has_gold(player):
+        need_gold = False
+    else:
+        need_gold = not has_gold(player)
 
-    alt_utils=[]
-    rem=REM if row['id'] in REM['id'].values else pd.concat([REM,row.to_frame().T])
+    alt_utils = []
+    rem = remaining_df()
     if need_gold:
-        alt_utils.append(rem[rem['Fur']=='Solid Gold']['Total Score'].apply(lambda x:0).max()+w_need_gold)  # fallback util for gold if none remain
+        gold_tokens = rem[rem['Fur'] == 'Solid Gold']
+        if not gold_tokens.empty:
+            alt_utils.append(max(utility_score(t, player, *weights) for _, t in gold_tokens.iterrows()))
+        else:
+            alt_utils.append(weights[1])  # fallback for no golds
     for bg in missing:
-        cand=rem[rem['Background']==bg]
-        if not cand.empty:
-            best_row=cand.iloc[cand['Total Score'].idxmax()]
-            alt_utils.append(preference(best_row,player))
-    util_total=util_this+sum(alt_utils)
-    free_cash=budget-len(missing_bgs(player))*1-(0 if has_gold(player) else 1)  # leave $1 per pending mandatory
-    free_cash=max(free_cash,0)
-    cash_alloc=free_cash*util_this/ util_total if util_total>0 else 0
-    cash_by_score=row['Total Score']/PTS_PER_DOLLAR
-    return round(min(cash_alloc,cash_by_score,budget),1)
+        bg_tokens = rem[rem['Background'] == bg]
+        if not bg_tokens.empty:
+            alt_utils.append(max(utility_score(t, player, *weights) for _, t in bg_tokens.iterrows()))
+        else:
+            alt_utils.append(weights[0])  # fallback for no bgs
 
-# cache bid matrix
-@st.cache_data
-def build_bids(ids_tuple, players_tuple):
-    sub=df[df['id'].isin(ids_tuple)].reset_index(drop=True)
-    out=sub[['id','Background','Fur','Total Score']].copy()
-    for p in players_tuple:
-        out[p]=[max_bid(r,p) for _,r in sub.iterrows()]
-    return out
+    total_util = u + sum(alt_utils)
+    safe_cash = max(budget - (1 * (len(missing) + (1 if need_gold else 0))), 0)
+    bid = (u / total_util) * safe_cash if total_util > 0 else 0
+    return round(min(bid, budget), 1)
 
-# ---------- UI -----------------------------------------------------------
-auct_tab, browse_tab = st.tabs(["Auction","Remaining tokens"])
+# =============== SIDEBAR CONFIG ===============
+st.sidebar.title("Game Setup")
+S.num_players = st.sidebar.number_input("Players incl. you", 2, 20, value=S.num_players)
+for i in range(1, S.num_players + 1):
+    S.players.setdefault(f"Player {i}", {"budget": STARTING_BUDGET, "tokens": []})
 
-with auct_tab:
-    st.title("Auction")
-    tid=st.text_input("Token ID on block")
-    if tid:
+st.sidebar.title("Utility Weights")
+w_bg = st.sidebar.slider("Need bonus (background)", 0, 30, DEFAULT_NEED_BG)
+w_gold = st.sidebar.slider("Need bonus (Gold fur)", 0, 30, DEFAULT_NEED_GOLD)
+w_block = st.sidebar.slider("Block bonus per rival", 0, 20, DEFAULT_BLOCK)
+w_scar = st.sidebar.slider("Scarcity scale", 0.0, 3.0, DEFAULT_SCARCITY)
+weights = (w_bg, w_gold, w_block, w_scar)
+
+# =============== MAIN TABS ===============
+auction_tab, browse_tab = st.tabs(["🎯 Auction Mode", "📦 Token Overview"])
+
+with auction_tab:
+    st.title("Live Auction Tracker")
+    token_id = st.text_input("Current Token ID")
+    if token_id:
         try:
-            tid=int(tid)
-            token=df[df['id']==tid].iloc[0]
-            st.json(token[['Background','Fur','Total Score']].to_dict())
-            bids=build_bids((tid,),tuple(S.players.keys()))
-            st.dataframe(bids.set_index('id'))
-        except: st.error("Invalid id")
+            tid = int(token_id)
+            token = df[df['id'] == tid].iloc[0]
+            st.subheader("Token Info")
+            st.json(token[['Background', 'Fur', 'Total Score']].to_dict())
+            bids = {
+                p: calculate_bid(token, p, weights)
+                for p in S.players
+            }
+            bid_df = pd.DataFrame.from_dict(bids, orient='index', columns=['Max Bid ($)'])
+            st.subheader("Suggested Bids")
+            st.dataframe(bid_df)
+        except:
+            st.warning("Invalid token ID")
+
     st.divider()
-    with st.form("log"):
-        sold=st.text_input("Sold id")
-        buyer=st.selectbox("Buyer", list(S.players.keys()))
-        price=st.number_input("Price",1,50,1)
-        if st.form_submit_button("Record"):
+    with st.form("📥 Log Auction Result"):
+        sid = st.text_input("Sold Token ID")
+        buyer = st.selectbox("Winner", list(S.players.keys()))
+        price = st.number_input("Winning Price", 1, 50, 1)
+        if st.form_submit_button("Log Token"):
             try:
-                sid=int(sold)
-                if sid in S.sold: st.warning("Already logged")
-                else:
-                    S.sold.add(sid)
-                    S.players[buyer]['tokens'].append(sid)
-                    S.players[buyer]['budget']-=price
-                    st.success("Logged")
-            except: st.error("Bad id")
+                sid = int(sid)
+                S.auctioned_ids.add(sid)
+                S.players[buyer]['tokens'].append(sid)
+                S.players[buyer]['budget'] -= price
+                st.success(f"Token {sid} added to {buyer} for ${price}")
+            except:
+                st.error("Invalid ID")
+
     st.divider()
-    matrix=pd.DataFrame([{**{"Player":p,"Budget":d['budget']},
-                          **{bg:("✅" if bg not in missing_bgs(p) else "❌") for bg in MANDATORY_BGS},
-                          **{"Gold":"✅" if has_gold(p) else "❌"}}
-                         for p,d in S.players.items()])
-    st.dataframe(matrix.set_index('Player'))
+    st.subheader("Player Overview")
+    matrix = pd.DataFrame([{
+        "Player": p,
+        **player_status(p)
+    } for p in S.players])
+    st.dataframe(matrix.set_index("Player"))
 
 with browse_tab:
-    st.title("Remaining tokens")
-    filtered=REM.sort_values('Total Score',ascending=False)
-    st.dataframe(filtered[['id','Background','Fur','Total Score']])
+    st.title("Remaining Tokens")
+    rem = remaining_df()
+    col1, col2 = st.columns(2)
+    with col1:
+        bgs = st.multiselect("Filter Backgrounds", options=["All"] + MANDATORY_BACKGROUNDS, default=["All"])
+        if "All" not in bgs:
+            rem = rem[rem['Background'].isin(bgs)]
+    with col2:
+        if st.checkbox("Gold Only"):
+            rem = rem[rem['Fur'] == 'Solid Gold']
+
+    st.dataframe(rem[['id', 'Background', 'Fur', 'Total Score']].sort_values('Total Score', ascending=False))
